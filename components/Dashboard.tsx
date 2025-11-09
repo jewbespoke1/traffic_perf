@@ -13,9 +13,42 @@ import { useDataContext } from '@/components/providers/DataProvider';
 import { DataTable } from '@/components/ui/DataTable';
 import { PerformanceMonitor } from '@/components/ui/PerformanceMonitor';
 import { getColorForSubdomain } from '@/lib/colors';
-import { AggregationWindow, ChartDomains, ChartSeries, SUBDOMAINS } from '@/lib/types';
+import {
+  AggregatePoint,
+  AggregationWindow,
+  ChartDomains,
+  ChartSeries,
+  SUBDOMAINS,
+} from '@/lib/types';
 
 const FOCUS_SUBDOMAINS = ['shop', 'api', 'media', 'analytics'] as const;
+
+function createEmptyPoint(ts: number, bucketSize: number): AggregatePoint {
+  const bySubdomain: AggregatePoint['bySubdomain'] = {
+    www: 0,
+    api: 0,
+    auth: 0,
+    cdn: 0,
+    media: 0,
+    blog: 0,
+    shop: 0,
+    support: 0,
+    status: 0,
+    dev: 0,
+    docs: 0,
+    analytics: 0,
+  };
+  return {
+    bucketStart: ts,
+    bucketSize,
+    rps: 0,
+    bySubdomain,
+    p50: 0,
+    p95: 0,
+    errors: 0,
+    totalRequests: 0,
+  };
+}
 
 export function DashboardShell() {
   const {
@@ -23,6 +56,7 @@ export function DashboardShell() {
     latestEvents,
     filters,
     setRate,
+    setProfile,
     selectWindow,
     windowSize,
     dropped,
@@ -30,6 +64,7 @@ export function DashboardShell() {
   } = useDataContext();
 
   const [traffic, setTraffic] = useState(12_000);
+  const [autoProfile, setAutoProfile] = useState(true);
 
   const sortedAggregates = useMemo(
     () =>
@@ -56,6 +91,10 @@ export function DashboardShell() {
       .slice(-5_000);
   }, [latestEvents, filters]);
 
+  const latestBucketTs = sortedAggregates.length
+    ? sortedAggregates[sortedAggregates.length - 1].bucketStart
+    : 0;
+
   const lineSeries = useMemo<{
     series: ChartSeries[];
     domains: ChartDomains;
@@ -66,38 +105,45 @@ export function DashboardShell() {
         domains: { x: [0, 1], y: [0, 1] },
       };
     }
-    const len = sortedAggregates.length;
-    const totalX = new Float32Array(len);
-    const totalY = new Float32Array(len);
-    let ptr = 0;
-    let maxY = 0;
+
+    const bucketSize = sortedAggregates[0]?.bucketSize ?? 1_000;
+    const latest = sortedAggregates[sortedAggregates.length - 1];
+    const bucketCount = Math.max(1, Math.ceil(60_000 / bucketSize));
+    const normalizedEnd = latest.bucketStart;
+    const normalizedStart = normalizedEnd - (bucketCount - 1) * bucketSize;
+    const horizonEnd = normalizedEnd + bucketSize;
+    const bucketMap = new Map(sortedAggregates.map((point) => [point.bucketStart, point]));
 
     const activeSubs =
-      filters.subdomains.length > 0
-        ? filters.subdomains
-        : FOCUS_SUBDOMAINS;
+      filters.subdomains.length > 0 ? filters.subdomains : FOCUS_SUBDOMAINS;
 
-    const seriesMap = new Map<string, { x: Float32Array; y: Float32Array }>();
+    const totalX = new Float32Array(bucketCount);
+    const totalY = new Float32Array(bucketCount);
+    const subSeries = new Map<string, { x: Float32Array; y: Float32Array }>();
     activeSubs.forEach((subdomain) => {
-      seriesMap.set(subdomain, {
-        x: new Float32Array(len),
-        y: new Float32Array(len),
+      subSeries.set(subdomain, {
+        x: new Float32Array(bucketCount),
+        y: new Float32Array(bucketCount),
       });
     });
 
-    for (const point of sortedAggregates) {
-      totalX[ptr] = point.bucketStart;
+    let maxY = 0;
+    let ptr = 0;
+    for (let ts = normalizedStart; ts <= normalizedEnd; ts += bucketSize) {
+      const point = bucketMap.get(ts) ?? createEmptyPoint(ts, bucketSize);
+      totalX[ptr] = ts;
       totalY[ptr] = point.rps;
       maxY = Math.max(maxY, point.rps);
+
       for (const subdomain of activeSubs) {
-        const record = seriesMap.get(subdomain);
+        const record = subSeries.get(subdomain);
         if (!record) continue;
-        record.x[ptr] = point.bucketStart;
-        record.y[ptr] =
-          (point.bySubdomain[subdomain as keyof typeof point.bySubdomain] *
-            1_000) /
+        record.x[ptr] = ts;
+        const perSecond =
+          (point.bySubdomain[subdomain as keyof typeof point.bySubdomain] * 1_000) /
           point.bucketSize;
-        maxY = Math.max(maxY, record.y[ptr]);
+        record.y[ptr] = perSecond;
+        maxY = Math.max(maxY, perSecond);
       }
       ptr += 1;
     }
@@ -111,7 +157,7 @@ export function DashboardShell() {
       },
     ];
 
-    seriesMap.forEach((record, key) => {
+    subSeries.forEach((record, key) => {
       series.push({
         label: `${key}.dummdomain`,
         color: getColorForSubdomain(key),
@@ -123,49 +169,103 @@ export function DashboardShell() {
     return {
       series,
       domains: {
-        x: [sortedAggregates[0].bucketStart, sortedAggregates[len - 1].bucketStart],
-        y: [0, maxY * 1.2],
+        x: [normalizedStart, horizonEnd],
+        y: [0, Math.max(maxY * 1.15, 1)],
       },
     };
   }, [sortedAggregates, filters.subdomains]);
 
   const barSeries = useMemo(() => {
-    const latestBuckets = sortedAggregates.slice(-8);
-    const categories = latestBuckets.map((point) =>
-      new Date(point.bucketStart).toLocaleTimeString('en-US', {
-        hour12: false,
-        minute: '2-digit',
-        second: '2-digit',
-      }),
-    );
+    if (sortedAggregates.length === 0) {
+      return { stacks: [], categories: [] as string[] };
+    }
+    const bucketSize = sortedAggregates[0]?.bucketSize ?? 1_000;
+    const latest = sortedAggregates[sortedAggregates.length - 1];
+    const bucketCount = Math.max(1, Math.ceil(15_000 / bucketSize));
+    const normalizedEnd = latest.bucketStart;
+    const normalizedStart = normalizedEnd - (bucketCount - 1) * bucketSize;
+    const bucketMap = new Map(sortedAggregates.map((point) => [point.bucketStart, point]));
     const activeSubs =
       filters.subdomains.length > 0 ? filters.subdomains : FOCUS_SUBDOMAINS;
+
+    const categories: string[] = [];
+    const matrix: Record<string, number[]> = {};
+    activeSubs.forEach((subdomain) => {
+      matrix[subdomain] = new Array(bucketCount).fill(0);
+    });
+
+    let index = 0;
+    for (let ts = normalizedStart; ts <= normalizedEnd; ts += bucketSize) {
+      const point = bucketMap.get(ts) ?? createEmptyPoint(ts, bucketSize);
+      categories.push(
+        new Date(ts).toLocaleTimeString('en-US', {
+          hour12: false,
+          minute: '2-digit',
+          second: '2-digit',
+        }),
+      );
+      for (const subdomain of activeSubs) {
+        const rps =
+          (point.bySubdomain[subdomain as keyof typeof point.bySubdomain] * 1_000) /
+          point.bucketSize;
+        matrix[subdomain][index] = rps;
+      }
+      index += 1;
+    }
+
     const stacks = activeSubs.map((subdomain) => ({
       label: `${subdomain}.dummdomain`,
       color: getColorForSubdomain(subdomain),
-      values: latestBuckets.map(
-        (point) =>
-          (point.bySubdomain[subdomain as keyof typeof point.bySubdomain] *
-            1_000) /
-          point.bucketSize,
-      ),
+      values: matrix[subdomain],
     }));
     return { stacks, categories };
   }, [sortedAggregates, filters.subdomains]);
 
-  const scatterPoints = useMemo(
-    () =>
-      filteredEvents.map((event) => ({
+  const scatterData = useMemo(() => {
+    if (filteredEvents.length === 0) {
+      return {
+        points: [] as { x: number; y: number }[],
+        domain: { x: [0, 1], y: [0, 1] } satisfies ChartDomains,
+      };
+    }
+    const fallbackTs = latestBucketTs || filteredEvents[filteredEvents.length - 1].ts;
+    const latestTs = filteredEvents[filteredEvents.length - 1]?.ts ?? fallbackTs;
+    const horizonStart = latestTs - 60_000;
+    const recent = filteredEvents
+      .filter((event) => event.ts >= horizonStart)
+      .sort((a, b) => a.ts - b.ts);
+    const maxLatency =
+      recent.reduce((max, event) => Math.max(max, event.latencyMs), 0) || 100;
+    return {
+      points: recent.map((event) => ({
         x: event.ts,
         y: event.latencyMs,
       })),
-    [filteredEvents],
-  );
+      domain: {
+        x: [horizonStart, latestTs] as [number, number],
+        y: [0, Math.max(maxLatency * 1.1, 50)] as [number, number],
+      } satisfies ChartDomains,
+    };
+  }, [filteredEvents, latestBucketTs]);
 
   const heatmap = useMemo(() => {
+    if (filteredEvents.length === 0) {
+      return {
+        points: [] as { x: string; y: string; weight: number }[],
+        xLabels: [] as string[],
+        yLabels: [] as string[],
+      };
+    }
+
+    const fallbackTs =
+      latestBucketTs || filteredEvents[filteredEvents.length - 1]?.ts || 0;
+    const latestTs = filteredEvents[filteredEvents.length - 1]?.ts ?? fallbackTs;
+    const horizonStart = latestTs - 60_000;
+    const recent = filteredEvents.filter((event) => event.ts >= horizonStart);
+
     const counts = new Map<string, number>();
     const pathTotals = new Map<string, number>();
-    filteredEvents.forEach((event) => {
+    recent.forEach((event) => {
       const normalized = normalizePath(event.path);
       const key = `${event.subdomain}|${normalized}`;
       counts.set(key, (counts.get(key) ?? 0) + 1);
@@ -188,7 +288,7 @@ export function DashboardShell() {
       xLabels: topPaths,
       yLabels: rows,
     };
-  }, [filteredEvents, filters.subdomains]);
+  }, [filteredEvents, filters.subdomains, latestBucketTs]);
 
   const topCards = useMemo(() => {
     const current = sortedAggregates[sortedAggregates.length - 1];
@@ -252,8 +352,30 @@ export function DashboardShell() {
             onChange={(value) => {
               setTraffic(value);
               setRate(value);
+              if (autoProfile) {
+                setAutoProfile(false);
+                setProfile(false);
+              }
             }}
           />
+          <button
+            type="button"
+            onClick={() => {
+              const next = !autoProfile;
+              setAutoProfile(next);
+              setProfile(next);
+            }}
+            className={`flex w-full items-center justify-between rounded-lg border px-3 py-2 text-xs transition ${
+              autoProfile
+                ? 'border-sky-500/60 bg-sky-500/15 text-sky-100'
+                : 'border-slate-700 bg-slate-900/50 text-slate-300 hover:border-slate-500 hover:text-slate-200'
+            }`}
+          >
+            <span>{autoProfile ? 'Circadian profile enabled' : 'Manual traffic control'}</span>
+            <span className="uppercase tracking-wide">
+              {autoProfile ? 'on' : 'off'}
+            </span>
+          </button>
           <div className="grid gap-4 sm:grid-cols-2">
             <TimeRangeSelector
               value={windowSize}
@@ -273,7 +395,8 @@ export function DashboardShell() {
           title="Requests per second"
         />
         <ScatterPlot
-          points={scatterPoints}
+          points={scatterData.points}
+          domain={scatterData.domain}
           title="Latency timeline"
           sampleSize={2_000}
         />
