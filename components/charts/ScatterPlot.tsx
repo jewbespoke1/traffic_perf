@@ -13,6 +13,7 @@ type ScatterPlotProps = {
   title?: string;
   xLabel?: string;
   yLabel?: string;
+  domain?: ChartDomains;
 };
 
 export function ScatterPlot({
@@ -20,31 +21,58 @@ export function ScatterPlot({
   sampleSize = 2000,
   height = 240,
   title,
-  xLabel = 'Latency (ms)',
-  yLabel = 'Requests per second',
+  xLabel = 'Time (s)',
+  yLabel = 'Latency (ms)',
+  domain,
 }: ScatterPlotProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [dimensions, setDimensions] = useState({ width: 600, height });
 
   const { xs, ys, domains } = useMemo(() => {
-    const sampled = points.length > sampleSize ? reservoirSample(points, sampleSize) : points;
+    const sampled =
+      points.length > sampleSize ? reservoirSample(points, sampleSize) : points;
+    if (sampled.length === 0) {
+      return {
+        xs: new Float32Array(0),
+        ys: new Float32Array(0),
+        domains:
+          domain ??
+          ({
+            x: [0, 1] as [number, number],
+            y: [0, 1] as [number, number],
+          } as ChartDomains),
+      };
+    }
     const xs = new Float32Array(sampled.map((point) => point.x));
     const ys = new Float32Array(sampled.map((point) => point.y));
-    const domainX: [number, number] = [
-      Math.min(...sampled.map((p) => p.x), 0),
-      Math.max(...sampled.map((p) => p.x), 1),
-    ];
-    const domainY: [number, number] = [
-      Math.min(...sampled.map((p) => p.y), 0),
-      Math.max(...sampled.map((p) => p.y), 1),
-    ];
+    const baseDomain: ChartDomains =
+      domain ?? {
+        x: [
+          Math.min(...sampled.map((p) => p.x)),
+          Math.max(...sampled.map((p) => p.x)),
+        ] as [number, number],
+        y: [
+          Math.min(...sampled.map((p) => p.y)),
+          Math.max(...sampled.map((p) => p.y)),
+        ] as [number, number],
+      };
+    const safeDomain: ChartDomains = {
+      x:
+        baseDomain.x[0] === baseDomain.x[1]
+          ? ([baseDomain.x[0] - 500, baseDomain.x[0] + 500] as [number, number])
+          : baseDomain.x,
+      y:
+        baseDomain.y[0] === baseDomain.y[1]
+          ? ([baseDomain.y[0] - 10, baseDomain.y[0] + 10] as [number, number])
+          : baseDomain.y,
+    };
     return {
       xs,
       ys,
-      domains: { x: domainX, y: domainY } satisfies ChartDomains,
+      domains: safeDomain,
     };
-  }, [points, sampleSize]);
+  }, [points, sampleSize, domain]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -71,8 +99,8 @@ export function ScatterPlot({
     width: dimensions.width,
     height: dimensions.height,
     margin: 40,
-    xFormatter: (value) => `${value.toFixed(0)}ms`,
-    yFormatter: (value) => value.toFixed(0),
+    xFormatter: (value) => formatTime(value),
+    yFormatter: (value) => `${value.toFixed(0)}ms`,
   });
 
   return (
@@ -92,3 +120,10 @@ export function ScatterPlot({
   );
 }
 
+function formatTime(value: number) {
+  const date = new Date(value);
+  return `${date.getMinutes().toString().padStart(2, '0')}:${date
+    .getSeconds()
+    .toString()
+    .padStart(2, '0')}`;
+}
